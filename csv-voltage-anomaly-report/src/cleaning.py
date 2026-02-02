@@ -1,88 +1,75 @@
 import pandas as pd
+import numpy as np
 
 def clean_column_names(df):
-    """
-    Step 1: Lowercase and map columns to 'voltage' and 'timestamp'.
-    """
-    # Lowercase everything for easier matching
-    df.columns = [col.lower() for col in df.columns]
+    """Step 1: Standardize naming to a strict schema."""
+    df.columns = [col.lower().strip() for col in df.columns]
     
-    voltage_candidates = ["voltage", "v", "volt", "reading"]
-    time_candidates = ["timestamp", "time", "date"]
-    
-    # Map Voltage Column
-    chosen_voltage = next((col for col in df.columns if col in voltage_candidates), None)
-    if not chosen_voltage:
-        raise ValueError(f"Could not find a voltage column. Looked for: {voltage_candidates}")
+    # Mapping logic
+    mapping = {
+        'v': 'voltage', 'volt': 'voltage', 'reading': 'voltage',
+        'time': 'timestamp', 'date': 'timestamp'
+    }
+    # Check for partial matches or direct matches
+    new_cols = {col: mapping[col] for col in df.columns if col in mapping}
+    return df.rename(columns=new_cols)
 
-    # Map Timestamp Column
-    chosen_time = next((col for col in df.columns if col in time_candidates), None)
+def sanitize_voltage_values(df, min_v=10.0, max_v=15.0):
+    """Step 2: Numeric conversion and physical boundary enforcement."""
+    initial_count = len(df)
     
-    rename_dict = {chosen_voltage: "voltage"}
-    if chosen_time:
-        rename_dict[chosen_time] = "timestamp"
+    # Clean string artifacts (like 'V' or 'v') before numeric conversion
+    if df['voltage'].dtype == 'object':
+        df['voltage'] = df['voltage'].str.replace(r'[Vv]', '', regex=True)
     
-    return df.rename(columns=rename_dict)
-
-def sanitize_voltage_values(df, min_v=0, max_v=1000):
-    """
-    Step 2: Convert voltage strings to clean floats and remove outliers.
-    """
-    # Remove units and whitespace, then convert to numeric
-    df['voltage'] = (
-        df['voltage']
-        .astype(str)
-        .str.replace(r'[Vv]', '', regex=True)
-        .str.strip()
-    )
-    
-    # initial count for reporting
-    initial_len = len(df)
+    # Coerce errors to NaN - this is where we "find" the garbage strings
     df['voltage'] = pd.to_numeric(df['voltage'], errors='coerce')
     
-    # Drop rows where conversion failed (NaN)
-    df = df.dropna(subset=['voltage'])
+    # Create a mask for valid physics
+    # Note: We keep NaNs for now to count them separately
+    valid_physics = (df['voltage'] >= min_v) & (df['voltage'] <= max_v)
     
-    # Filter by physical bounds
-    df = df[(df['voltage'] >= min_v) & (df['voltage'] <= max_v)]
+    # Count specific failures for the report
+    type_failures = df['voltage'].isna().sum()
+    physics_violations = (~valid_physics & df['voltage'].notna()).sum()
     
-    removed = initial_len - len(df)
-    if removed > 0:
-        print(f"Sanitization: Removed {removed} invalid or out-of-range voltage rows.")
-        
-    return df
+    # Apply the filter
+    df = df[valid_physics].copy()
+    
+    return df, {"type_errors": type_failures, "physics_errors": physics_violations}
 
 def finalize_time_index(df):
-    """
-    Step 3: Handle sorting, duplicates, and missing time data.
-    """
-    if 'timestamp' in df.columns:
-        # Convert and drop invalid dates
-        df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
-        df = df.dropna(subset=['timestamp'])
+    """Step 3: Temporal alignment and duplicate removal."""
+    if 'timestamp' not in df.columns:
+        df['timestamp'] = pd.date_range(start='2026-01-01', periods=len(df), freq='5T')
+    
+    df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+    df = df.dropna(subset=['timestamp'])
+    
+    # Sort to ensure chronological order before checking duplicates
+    df = df.sort_values('timestamp')
+    dupes = df.duplicated(subset=['timestamp']).sum()
+    df = df.drop_duplicates(subset=['timestamp'], keep='first')
+    
+    return df, {"duplicates": dupes}
 
-        # Sort and drop duplicates
-        df = df.sort_values(by='timestamp')
-        
-        dupes = df.duplicated(subset=['timestamp']).sum()
-        if dupes > 0:
-            print(f"Time Index: Dropped {dupes} duplicate timestamps.")
-            df = df.drop_duplicates(subset=['timestamp'], keep='first')
-    else:
-        # Fallback to a simple index
-        print("Time Index: No timestamp found. Using sequential index.")
-        df['sample_index'] = range(len(df))
-        # Move sample_index to the first column
-        cols = ['sample_index'] + [c for c in df.columns if c != 'sample_index']
-        df = df[cols]
-
-    return df.reset_index(drop=True)
-
-def run_cleaning_pipeline(df):
-    """
-    Helper function to run the entire cleaning process in order.
-    """
+def run_cleaning_pipeline(df, min_v=10.0, max_v=15.0):
+    """The 'Bottled Judgment' Entry Point."""
+    original_count = len(df)
+    
+    # Station 1: Schema
     df = clean_column_names(df)
-    df = sanitize_voltage_values(df)
-    df = finalize_time_index(df)
+    
+    # Station 2: Voltage Logic
+    df, v_stats = sanitize_voltage_values(df, min_v, max_v)
+    
+    # Station 3: Time Logic
+    df, t_stats = finalize_time_index(df)
+    
+    # Final Reporting
+    retention = (len(df) / original_count) * 100
+    print(f"--- Pipeline Audit ---")
+    print(f"Rows Retained: {len(df)} ({retention:.1f}%)")
+    print(f"Failures: {v_stats['type_errors']} strings, {v_stats['physics_errors']} physics, {t_stats['duplicates']} dupes")
+    
     return df
